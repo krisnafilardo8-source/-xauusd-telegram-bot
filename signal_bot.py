@@ -5,18 +5,33 @@ import time
 import requests
 import pandas as pd
 
+# ============================================================
+# ARDSNIPER BOT - XAUUSD SUPPORT/RESISTANCE + CANDLESTICK
+# Timeframe: M15
+# ============================================================
+
 CHART_URL = "https://xaus.com/api/v1/chart"
 RELAY_URL = "https://krisnafilardo.pythonanywhere.com/tv-webhook"
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
 STATE_FILE = "last_candle.txt"
 
+TIMEFRAME = "M15"
 TIMEFRAME_SECONDS = 15 * 60
-ATR_MULTIPLIER = 1.5
+
+CANDLE_RANGE = 30
+ATR_PERIOD = 14
+ATR_SL_BUFFER = 0.25
+RR_RATIO = 2.0
+
 MAX_CANDLE_AGE_SECONDS = 45 * 60
+REQUEST_TIMEOUT = 30
 
 
 def fetch_candles():
+    """Mengambil candle XAUUSD dari XAUS."""
+
     response = requests.get(
         CHART_URL,
         params={
@@ -24,219 +39,282 @@ def fetch_candles():
             "range": "5d",
             "interval": "15m",
         },
-        timeout=30,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
 
-    data = response.json()
-    points = data.get("points", [])
+    payload = response.json()
+    points = payload.get("points", [])
 
     if not points:
-        raise RuntimeError("API XAUS tidak mengembalikan candle.")
+        raise RuntimeError("API tidak mengembalikan data candle.")
 
     df = pd.DataFrame(points)
 
     required = ["t", "o", "h", "l", "c"]
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise RuntimeError(
-            f"Kolom candle tidak lengkap: {missing}"
-        )
+    missing = [column for column in required if column not in df.columns]
 
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if missing:
+        raise RuntimeError(f"Kolom candle tidak lengkap: {missing}")
+
+    for column in required:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df = df.dropna(subset=required)
     df = df.sort_values("t").drop_duplicates("t")
     df["t"] = df["t"].astype("int64")
 
+    # Menggunakan candle yang sudah benar-benar tertutup.
     now = int(time.time())
-
-    # Gunakan hanya candle yang sudah selesai.
     df = df[df["t"] + TIMEFRAME_SECONDS <= now].copy()
 
     if len(df) < 60:
         raise RuntimeError(
-            f"Candle tertutup tidak cukup: {len(df)}"
+            f"Candle tertutup tidak cukup untuk analisis: {len(df)}"
         )
 
-    latest_age = now - int(df.iloc[-1]["t"])
+    candle_age = now - int(df.iloc[-1]["t"])
 
-    if latest_age > MAX_CANDLE_AGE_SECONDS:
+    if candle_age > MAX_CANDLE_AGE_SECONDS:
         raise RuntimeError(
-            f"Data candle terlalu lama: {latest_age} detik."
+            f"Data candle terlalu lama: {candle_age} detik."
         )
 
     return df.reset_index(drop=True)
 
 
-def calculate_indicators(df):
-    close = df["c"]
-    high = df["h"]
-    low = df["l"]
+def calculate_atr(df):
+    """Menghitung ATR untuk buffer Stop Loss."""
 
-    df["ema9"] = close.ewm(
-        span=9, adjust=False
-    ).mean()
-
-    df["ema21"] = close.ewm(
-        span=21, adjust=False
-    ).mean()
-
-    df["ema50"] = close.ewm(
-        span=50, adjust=False
-    ).mean()
-
-    previous_close = close.shift(1)
+    previous_close = df["c"].shift(1)
 
     true_range = pd.concat(
         [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
+            df["h"] - df["l"],
+            (df["h"] - previous_close).abs(),
+            (df["l"] - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    df["atr14"] = true_range.ewm(
-        alpha=1 / 14,
+    return true_range.ewm(
+        alpha=1 / ATR_PERIOD,
         adjust=False,
-        min_periods=14,
+        min_periods=ATR_PERIOD,
     ).mean()
 
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14,
-    ).mean()
+def is_bullish_engulfing(previous, current):
+    """Candle bullish menelan body candle bearish sebelumnya."""
 
-    avg_loss = loss.ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14,
-    ).mean()
+    previous_bearish = previous["c"] < previous["o"]
+    current_bullish = current["c"] > current["o"]
 
-    rs = avg_gain / avg_loss
-    df["rsi14"] = 100 - (100 / (1 + rs))
-
-    # Kasus pergerakan satu arah ekstrem.
-    df.loc[
-        (avg_loss == 0) & (avg_gain > 0), "rsi14"
-    ] = 100
-
-    df.loc[
-        (avg_gain == 0) & (avg_loss > 0), "rsi14"
-    ] = 0
-
-    df.loc[
-        (avg_gain == 0) & (avg_loss == 0), "rsi14"
-    ] = 50
-
-    return df
-
-
-def determine_signal(row):
-    if row[
-        ["ema9", "ema21", "ema50", "rsi14", "atr14"]
-    ].isna().any():
-        return "WAIT"
-
-    buy = (
-        row["ema9"] > row["ema21"]
-        and row["ema21"] > row["ema50"]
-        and row["rsi14"] > 50
-        and row["c"] > row["ema9"]
+    return (
+        previous_bearish
+        and current_bullish
+        and current["o"] <= previous["c"]
+        and current["c"] >= previous["o"]
     )
 
-    sell = (
-        row["ema9"] < row["ema21"]
-        and row["ema21"] < row["ema50"]
-        and row["rsi14"] < 50
-        and row["c"] < row["ema9"]
+
+def is_bearish_engulfing(previous, current):
+    """Candle bearish menelan body candle bullish sebelumnya."""
+
+    previous_bullish = previous["c"] > previous["o"]
+    current_bearish = current["c"] < current["o"]
+
+    return (
+        previous_bullish
+        and current_bearish
+        and current["o"] >= previous["c"]
+        and current["c"] <= previous["o"]
     )
 
-    if buy:
-        return "BUY"
 
-    if sell:
-        return "SELL"
+def is_bullish_pinbar(candle):
+    candle_range = candle["h"] - candle["l"]
 
-    return "WAIT"
+    if candle_range <= 0:
+        return False
 
+    body = abs(candle["c"] - candle["o"])
+    lower_wick = min(candle["o"], candle["c"]) - candle["l"]
+    upper_wick = candle["h"] - max(candle["o"], candle["c"])
 
-def build_message(row, signal):
-    candle_time = pd.to_datetime(
-        int(row["t"]), unit="s", utc=True
+    return (
+        lower_wick >= body * 2
+        and lower_wick >= candle_range * 0.45
+        and upper_wick <= candle_range * 0.30
+        and candle["c"] > candle["l"] + candle_range * 0.55
     )
 
-    lines = [
-        "📊 XAUUSD SPOT SIGNAL | M15",
-        f"Waktu candle: {candle_time:%d-%m-%Y %H:%M} UTC",
-        f"Sinyal: {signal}",
-        f"Close: {row['c']:.2f}",
-        f"EMA 9: {row['ema9']:.2f}",
-        f"EMA 21: {row['ema21']:.2f}",
-        f"EMA 50: {row['ema50']:.2f}",
-        f"RSI 14: {row['rsi14']:.2f}",
-        f"ATR 14: {row['atr14']:.2f}",
-    ]
 
-    if signal == "BUY":
-        entry = row["c"]
-        sl = entry - ATR_MULTIPLIER * row["atr14"]
-        lines.extend([
-            f"Entry indikatif: {entry:.2f}",
-            f"Stop Loss (1.5 x ATR): {sl:.2f}",
-        ])
-    elif signal == "SELL":
-        entry = row["c"]
-        sl = entry + ATR_MULTIPLIER * row["atr14"]
-        lines.extend([
-            f"Entry indikatif: {entry:.2f}",
-            f"Stop Loss (1.5 x ATR): {sl:.2f}",
-        ])
-    else:
-        lines.append("Entry/SL: belum ada — tunggu konfirmasi")
+def is_bearish_pinbar(candle):
+    candle_range = candle["h"] - candle["l"]
 
-    lines.append(
-        "Catatan: sinyal indikator, bukan jaminan hasil trading."
+    if candle_range <= 0:
+        return False
+
+    body = abs(candle["c"] - candle["o"])
+    upper_wick = candle["h"] - max(candle["o"], candle["c"])
+    lower_wick = min(candle["o"], candle["c"]) - candle["l"]
+
+    return (
+        upper_wick >= body * 2
+        and upper_wick >= candle_range * 0.45
+        and lower_wick <= candle_range * 0.30
+        and candle["c"] < candle["l"] + candle_range * 0.45
     )
 
-    return "\n".join(lines)
+
+def determine_signal(df):
+    """
+    Support/resistance sederhana dari 30 candle sebelumnya.
+    Candle sinyal tidak dimasukkan dalam perhitungan level.
+    """
+
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    atr = current["atr"]
+
+    if pd.isna(atr) or atr <= 0:
+        return None
+
+    history = df.iloc[-(CANDLE_RANGE + 1):-1]
+
+    support = float(history["l"].min())
+    resistance = float(history["h"].max())
+
+    # Level dianggap dekat jika berada dalam 0.35 ATR.
+    proximity = atr * 0.35
+
+    near_support = (
+        current["l"] <= support + proximity
+        and current["c"] >= support
+    )
+
+    near_resistance = (
+        current["h"] >= resistance - proximity
+        and current["c"] <= resistance
+    )
+
+    bullish_pattern = (
+        is_bullish_engulfing(previous, current)
+        or is_bullish_pinbar(current)
+    )
+
+    bearish_pattern = (
+        is_bearish_engulfing(previous, current)
+        or is_bearish_pinbar(current)
+    )
+
+    if near_support and bullish_pattern:
+        if is_bullish_engulfing(previous, current):
+            pattern = "Bullish engulfing"
+        else:
+            pattern = "Bullish pin bar"
+
+        entry = float(current["c"])
+        sl = support - (atr * ATR_SL_BUFFER)
+        risk = entry - sl
+
+        if risk <= 0:
+            return None
+
+        tp = entry + (risk * RR_RATIO)
+
+        return {
+            "action": "BUY",
+            "price": float(current["c"]),
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "support": support,
+            "resistance": resistance,
+            "reason": (
+                f"Pantulan support + {pattern}; "
+                f"risiko:imbalan 1:{RR_RATIO:.0f}"
+            ),
+        }
+
+    if near_resistance and bearish_pattern:
+        if is_bearish_engulfing(previous, current):
+            pattern = "Bearish engulfing"
+        else:
+            pattern = "Bearish pin bar"
+
+        entry = float(current["c"])
+        sl = resistance + (atr * ATR_SL_BUFFER)
+        risk = sl - entry
+
+        if risk <= 0:
+            return None
+
+        tp = entry - (risk * RR_RATIO)
+
+        return {
+            "action": "SELL",
+            "price": float(current["c"]),
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "support": support,
+            "resistance": resistance,
+            "reason": (
+                f"Penolakan resistance + {pattern}; "
+                f"risiko:imbalan 1:{RR_RATIO:.0f}"
+            ),
+        }
+
+    return None
 
 
-def send_to_telegram(action, message):
-    if action not in ("BUY", "SELL"):
-        print(f"Tidak mengirim sinyal {action}.")
-        return
+def send_signal(signal, candle_timestamp):
+    """Mengirim field yang dibutuhkan app.py."""
 
     if not WEBHOOK_SECRET:
         raise RuntimeError(
-            "Secret WEBHOOK_SECRET belum diatur."
+            "WEBHOOK_SECRET belum tersedia di environment."
         )
 
-    # Catatan: format payload ini harus sesuai dengan app.py.
-    # Relay sebelumnya menolak WAIT; respons berikut membantu
-    # memeriksa format payload jika BUY/SELL juga ditolak.
+    chart_time = pd.to_datetime(
+        candle_timestamp,
+        unit="s",
+        utc=True,
+    ).strftime("%Y-%m-%d %H:%M UTC")
+
+    payload = {
+        "secret": WEBHOOK_SECRET,
+        "action": signal["action"],
+        "symbol": "XAUUSD",
+        "timeframe": TIMEFRAME,
+        "price": round(signal["price"], 2),
+        "entry": round(signal["entry"], 2),
+        "sl": round(signal["sl"], 2),
+        "tp": round(signal["tp"], 2),
+        "reason": signal["reason"],
+        "time": chart_time,
+    }
+
     response = requests.post(
         RELAY_URL,
-        json={
-            "secret": WEBHOOK_SECRET,
-            "action": action,
-            "message": message,
-        },
-        timeout=30,
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
     )
 
     print("Status relay:", response.status_code)
-    print("Respons relay:", response.text[:1000])
+    print("Respons relay:", response.text[:500])
 
     response.raise_for_status()
-    print("Relay menerima permintaan.")
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError("Relay menolak sinyal.")
+
+    print("Sinyal berhasil diterima relay.")
 
 
 def read_last_candle():
@@ -247,41 +325,48 @@ def read_last_candle():
         return ""
 
 
-def save_last_candle(candle_timestamp):
+def save_last_candle(timestamp):
     with open(STATE_FILE, "w", encoding="utf-8") as file:
-        file.write(str(candle_timestamp))
+        file.write(str(timestamp))
 
 
 def main():
     df = fetch_candles()
-    df = calculate_indicators(df)
+    df["atr"] = calculate_atr(df)
 
-    row = df.iloc[-1]
-    candle_id = str(int(row["t"]))
+    current = df.iloc[-1]
+    candle_id = str(int(current["t"]))
 
-    print("Candle UTC:", pd.to_datetime(
-        int(row["t"]), unit="s", utc=True
-    ).isoformat())
-
-    signal = determine_signal(row)
-    message = build_message(row, signal)
-
-    print(message)
+    print(
+        "Candle terakhir UTC:",
+        pd.to_datetime(
+            int(current["t"]), unit="s", utc=True
+        ).isoformat(),
+    )
+    print("Close:", round(float(current["c"]), 2))
+    print("ATR:", round(float(current["atr"]), 2))
 
     previous_candle = read_last_candle()
 
     if previous_candle == candle_id:
-        print("Candle ini sudah diproses sebelumnya.")
+        print("Candle ini sudah diproses.")
         return
 
-    if signal in ("BUY", "SELL"):
-        send_to_telegram(signal, message)
-    else:
-        print("Sinyal WAIT — tidak dikirim ke Telegram.")
+    signal = determine_signal(df)
 
-    # Simpan candle setelah analisis selesai.
-    # Jika pengiriman BUY/SELL gagal, exception terjadi sebelum
-    # penyimpanan sehingga candle bisa dicoba kembali.
+    if signal is None:
+        print("Tidak ada konfirmasi support/resistance + candlestick.")
+        save_last_candle(candle_id)
+        return
+
+    print("Sinyal:", signal["action"])
+    print("Entry:", round(signal["entry"], 2))
+    print("SL:", round(signal["sl"], 2))
+    print("TP:", round(signal["tp"], 2))
+    print("Alasan:", signal["reason"])
+
+    # Simpan candle hanya setelah relay menerima sinyal.
+    send_signal(signal, int(current["t"]))
     save_last_candle(candle_id)
 
 
