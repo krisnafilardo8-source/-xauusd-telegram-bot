@@ -236,11 +236,24 @@ def main():
     message = "\n".join(lines)
 
     print(message)
-    send_to_telegram(message)
+    def send_to_telegram(message):
+    if not WEBHOOK_SECRET:
+        raise RuntimeError("Secret WEBHOOK_SECRET belum diatur")
 
-    # Ditulis setelah relay berhasil menerima permintaan.
-    save_last_candle(candle_id)
-    print("Selesai.")
+    response = requests.post(
+        RELAY_URL,
+        json={
+            "secret": WEBHOOK_SECRET,
+            "message": message,
+        },
+        timeout=20,
+    )
+
+    print("Status relay:", response.status_code)
+    print("Respons relay:", response.text[:1500])
+
+    response.raise_for_status()
+    print("Relay menerima permintaan.")
 
 
 if __name__ == "__main__":
