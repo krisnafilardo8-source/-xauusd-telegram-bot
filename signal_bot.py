@@ -236,6 +236,7 @@ def main():
     message = "\n".join(lines)
 
     print(message)
+    send_to_telegram(message)
 def send_to_telegram(message):
     if not WEBHOOK_SECRET:
         raise RuntimeError("Secret WEBHOOK_SECRET belum diatur")
