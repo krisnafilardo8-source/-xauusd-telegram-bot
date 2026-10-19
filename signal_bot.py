@@ -236,7 +236,10 @@ def main():
     message = "\n".join(lines)
 
     print(message)
+if signal in ("BUY", "SELL"):
     send_to_telegram(message)
+else:
+    print("Sinyal WAIT — tidak dikirim ke Telegram.")
 def send_to_telegram(message):
     if not WEBHOOK_SECRET:
         raise RuntimeError("Secret WEBHOOK_SECRET belum diatur")
