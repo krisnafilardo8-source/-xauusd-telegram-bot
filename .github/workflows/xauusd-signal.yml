@@ -1,0 +1,16 @@
+
+name: XAUUSD Signal Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test workflow
+        run: |
+          echo "GitHub Actions berjalan"
+          date -u
